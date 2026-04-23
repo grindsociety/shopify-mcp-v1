@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Shopify MCP Server — Full Admin API access via FastMCP.
 Provides tools for managing products, orders, customers, collections,
@@ -850,16 +851,33 @@ async def shopify_link_option_to_metaobject(params: LinkOptionToMetaobjectInput)
                 f"Option '{params.option_name}' not found. Available options: {available}"
             ))
 
-        # 2) Run the productOptionUpdate mutation with linkedMetafield
+        # 2) Build optionValuesToUpdate — each existing option value needs to be
+        # mapped to a metaobject handle. Shopify requires explicit mappings.
+        # We auto-generate the handle by lowercasing and replacing spaces with dashes.
+        # E.g. "Marco blanco" -> "marco-blanco", "Sin marco" -> "sin-marco".
+        def _to_handle(name: str) -> str:
+            return name.strip().lower().replace(" ", "-")
+
+        option_values_to_update = [
+            {
+                "id": ov["id"],
+                "linkedMetafieldValue": _to_handle(ov["name"]),
+            }
+            for ov in target.get("optionValues", [])
+        ]
+
+        # 3) Run the productOptionUpdate mutation with linkedMetafield
         mutation = """
         mutation UpdateProductOption(
           $productId: ID!
           $option: OptionUpdateInput!
+          $optionValuesToUpdate: [OptionValueUpdateInput!]
           $variantStrategy: ProductOptionUpdateVariantStrategy
         ) {
           productOptionUpdate(
             productId: $productId
             option: $option
+            optionValuesToUpdate: $optionValuesToUpdate
             variantStrategy: $variantStrategy
           ) {
             product {
@@ -884,6 +902,7 @@ async def shopify_link_option_to_metaobject(params: LinkOptionToMetaobjectInput)
                     "key":       params.key,
                 },
             },
+            "optionValuesToUpdate": option_values_to_update,
             "variantStrategy": "LEAVE_AS_IS",
         }
 
@@ -906,6 +925,237 @@ async def shopify_link_option_to_metaobject(params: LinkOptionToMetaobjectInput)
             "linked_to":     f"{params.namespace}.{params.key}",
             "product":       payload.get("product"),
         })
+    except Exception as e:
+        return _error(e)
+# ═══════════════════════════════════════════════════════════════════════════
+# THEMES & ASSETS — edit storefront code (liquid, CSS, JS)
+# Requires scope: read_themes (read) + write_themes (update/delete)
+# ═══════════════════════════════════════════════════════════════════════════
+class ListThemesInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+@mcp.tool(
+    name="shopify_list_themes",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_list_themes(params: ListThemesInput) -> str:
+    """List all themes in the store. The active theme has role='main'."""
+    try:
+        data   = await _request("GET", "themes.json")
+        themes = data.get("themes", [])
+        return _fmt({"count": len(themes), "themes": themes})
+    except Exception as e:
+        return _error(e)
+
+
+class ListThemeAssetsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    theme_id: int = Field(..., description="Theme ID (get from shopify_list_themes)")
+
+
+@mcp.tool(
+    name="shopify_list_theme_assets",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_list_theme_assets(params: ListThemeAssetsInput) -> str:
+    """List all assets in a theme (templates, sections, snippets, assets/)."""
+    try:
+        data   = await _request("GET", f"themes/{params.theme_id}/assets.json")
+        assets = data.get("assets", [])
+        # Return only keys (names) to avoid huge payloads
+        keys = [a.get("key") for a in assets]
+        return _fmt({"count": len(keys), "asset_keys": keys})
+    except Exception as e:
+        return _error(e)
+
+
+class GetThemeAssetInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    theme_id: int = Field(..., description="Theme ID")
+    key:      str = Field(..., min_length=1, description="Asset key, e.g. 'sections/main-product.liquid'")
+
+
+@mcp.tool(
+    name="shopify_get_theme_asset",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_get_theme_asset(params: GetThemeAssetInput) -> str:
+    """Get the full content of a single theme asset (liquid / CSS / JS file)."""
+    try:
+        p    = {"asset[key]": params.key}
+        data = await _request("GET", f"themes/{params.theme_id}/assets.json", params=p)
+        return _fmt(data.get("asset", data))
+    except Exception as e:
+        return _error(e)
+
+
+class UpdateThemeAssetInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=False, extra="forbid")
+    theme_id: int = Field(..., description="Theme ID")
+    key:      str = Field(..., min_length=1, description="Asset key, e.g. 'sections/main-product.liquid'")
+    value:    str = Field(..., description="New full content of the asset (replaces existing content)")
+
+
+@mcp.tool(
+    name="shopify_update_theme_asset",
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_update_theme_asset(params: UpdateThemeAssetInput) -> str:
+    """
+    Update (or create) a theme asset's content. DESTRUCTIVE: replaces entire file content.
+    Always back up by reading the current asset first with shopify_get_theme_asset.
+    """
+    try:
+        body = {"asset": {"key": params.key, "value": params.value}}
+        data = await _request("PUT", f"themes/{params.theme_id}/assets.json", body=body)
+        return _fmt(data.get("asset", data))
+    except Exception as e:
+        return _error(e)
+
+
+class DeleteThemeAssetInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    theme_id: int = Field(..., description="Theme ID")
+    key:      str = Field(..., min_length=1, description="Asset key to delete")
+
+
+@mcp.tool(
+    name="shopify_delete_theme_asset",
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_delete_theme_asset(params: DeleteThemeAssetInput) -> str:
+    """Permanently delete a theme asset. Cannot be undone."""
+    try:
+        p = {"asset[key]": params.key}
+        await _request("DELETE", f"themes/{params.theme_id}/assets.json", params=p)
+        return f"Asset {params.key} deleted from theme {params.theme_id}."
+    except Exception as e:
+        return _error(e)
+# ═══════════════════════════════════════════════════════════════════════════
+# METAOBJECTS (GraphQL) — list, create, update metaobject entries
+# Requires scope: read_metaobjects + write_metaobjects
+# ═══════════════════════════════════════════════════════════════════════════
+class ListMetaobjectsInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    type:  str           = Field(..., min_length=1, description="Metaobject type, e.g. 'shopify--color-pattern'")
+    first: Optional[int] = Field(default=50, ge=1, le=250)
+
+
+@mcp.tool(
+    name="shopify_list_metaobjects",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_list_metaobjects(params: ListMetaobjectsInput) -> str:
+    """List metaobject entries of a given type."""
+    try:
+        query = """
+        query ListMetaobjects($type: String!, $first: Int!) {
+          metaobjects(type: $type, first: $first) {
+            edges {
+              node {
+                id
+                handle
+                type
+                displayName
+                fields { key value type }
+              }
+            }
+          }
+        }
+        """
+        result  = await _graphql(query, {"type": params.type, "first": params.first})
+        entries = [edge["node"] for edge in result.get("metaobjects", {}).get("edges", [])]
+        return _fmt({"count": len(entries), "metaobjects": entries})
+    except Exception as e:
+        return _error(e)
+
+
+class CreateMetaobjectInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    type:   str                   = Field(..., min_length=1, description="Metaobject type, e.g. 'shopify--color-pattern'")
+    handle: Optional[str]         = Field(default=None, description="Handle (auto-generated if omitted)")
+    fields: List[Dict[str, Any]]  = Field(..., description="Array of {key, value} pairs for this metaobject")
+
+
+@mcp.tool(
+    name="shopify_create_metaobject",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def shopify_create_metaobject(params: CreateMetaobjectInput) -> str:
+    """Create a new metaobject entry (e.g. a new swatch color)."""
+    try:
+        mutation = """
+        mutation CreateMetaobject($metaobject: MetaobjectCreateInput!) {
+          metaobjectCreate(metaobject: $metaobject) {
+            metaobject {
+              id
+              handle
+              type
+              displayName
+              fields { key value type }
+            }
+            userErrors { field message code }
+          }
+        }
+        """
+        metaobject_input: Dict[str, Any] = {
+            "type":   params.type,
+            "fields": params.fields,
+        }
+        if params.handle:
+            metaobject_input["handle"] = params.handle
+
+        result  = await _graphql(mutation, {"metaobject": metaobject_input})
+        payload = result.get("metaobjectCreate", {})
+        errors  = payload.get("userErrors", [])
+
+        if errors:
+            return _fmt({"success": False, "userErrors": errors})
+
+        return _fmt({"success": True, "metaobject": payload.get("metaobject")})
+    except Exception as e:
+        return _error(e)
+
+
+class UpdateMetaobjectInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    metaobject_id: str                  = Field(..., description="Full GID, e.g. 'gid://shopify/Metaobject/12345'")
+    fields:        List[Dict[str, Any]] = Field(..., description="Array of {key, value} pairs to update")
+
+
+@mcp.tool(
+    name="shopify_update_metaobject",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_update_metaobject(params: UpdateMetaobjectInput) -> str:
+    """Update an existing metaobject entry's fields."""
+    try:
+        mutation = """
+        mutation UpdateMetaobject($id: ID!, $metaobject: MetaobjectUpdateInput!) {
+          metaobjectUpdate(id: $id, metaobject: $metaobject) {
+            metaobject {
+              id
+              handle
+              type
+              fields { key value type }
+            }
+            userErrors { field message code }
+          }
+        }
+        """
+        variables = {
+            "id": params.metaobject_id,
+            "metaobject": {"fields": params.fields},
+        }
+        result  = await _graphql(mutation, variables)
+        payload = result.get("metaobjectUpdate", {})
+        errors  = payload.get("userErrors", [])
+
+        if errors:
+            return _fmt({"success": False, "userErrors": errors})
+
+        return _fmt({"success": True, "metaobject": payload.get("metaobject")})
     except Exception as e:
         return _error(e)
 # ---------------------------------------------------------------------------
