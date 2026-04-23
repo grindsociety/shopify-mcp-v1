@@ -815,9 +815,14 @@ class LinkOptionToMetaobjectInput(BaseModel):
 )
 async def shopify_link_option_to_metaobject(params: LinkOptionToMetaobjectInput) -> str:
     """
-    Link a product option (e.g. "Marco") to a Shopify metaobject (e.g. shopify.color-pattern)
-    via productOptionUpdate + linkedMetafield. This enables native swatches — option values
-    are auto-matched to metaobject entries by name.
+    Link a product option (e.g. "Marco") to a Shopify metaobject type (e.g. shopify.color-pattern)
+    to enable native swatches. Internally:
+      1. Looks up the option by name on the product.
+      2. Lists all metaobject entries of type `{namespace}--{key}` and builds a handle map.
+      3. For each option value, converts its name to a handle
+         ("Marco blanco" -> "marco-blanco") and maps it to the metaobject's GID.
+      4. Runs productOptionUpdate with linkedMetafield + optionValuesToUpdate.
+    Returns success=false with details if any option value can't be mapped.
     """
     try:
         product_gid = f"gid://shopify/Product/{params.product_id}"
@@ -1183,6 +1188,165 @@ async def shopify_update_metaobject(params: UpdateMetaobjectInput) -> str:
             return _fmt({"success": False, "userErrors": errors})
 
         return _fmt({"success": True, "metaobject": payload.get("metaobject")})
+    except Exception as e:
+        return _error(e)
+# ═══════════════════════════════════════════════════════════════════════════
+# BULK: link options across many products (avoids 1 tool call per product)
+# ═══════════════════════════════════════════════════════════════════════════
+class BulkLinkOptionsInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    product_ids: List[int] = Field(..., description="List of numeric Shopify product IDs")
+    option_name: str       = Field(..., min_length=1, description="Option name to link on every product, e.g. 'Marco'")
+    namespace:   str       = Field(default="shopify")
+    key:         str       = Field(default="color-pattern")
+
+
+@mcp.tool(
+    name="shopify_bulk_link_options_to_metaobject",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_bulk_link_options_to_metaobject(params: BulkLinkOptionsInput) -> str:
+    """
+    Bulk version of shopify_link_option_to_metaobject. Processes a list of products
+    sequentially, reusing the metaobject handle->GID mapping across calls.
+    Returns a compact summary: counts + only the failed product IDs with their errors.
+    """
+    try:
+        # 1) Fetch handle -> GID mapping ONCE (shared across all products)
+        metaobject_type = f"{params.namespace}--{params.key}"
+        list_query = """
+        query ListMetaobjects($type: String!, $first: Int!) {
+          metaobjects(type: $type, first: $first) {
+            edges { node { id handle } }
+          }
+        }
+        """
+        list_result   = await _graphql(list_query, {"type": metaobject_type, "first": 250})
+        handle_to_gid = {
+            edge["node"]["handle"]: edge["node"]["id"]
+            for edge in list_result.get("metaobjects", {}).get("edges", [])
+        }
+
+        if not handle_to_gid:
+            return _error(RuntimeError(
+                f"No metaobjects found for type '{metaobject_type}'. Check namespace/key."
+            ))
+
+        def _to_handle(name: str) -> str:
+            return name.strip().lower().replace(" ", "-")
+
+        fetch_query = """
+        query GetProductOptions($id: ID!) {
+          product(id: $id) {
+            id
+            options {
+              id
+              name
+              optionValues { id name }
+            }
+          }
+        }
+        """
+
+        mutation = """
+        mutation UpdateProductOption(
+          $productId: ID!
+          $option: OptionUpdateInput!
+          $optionValuesToUpdate: [OptionValueUpdateInput!]
+          $variantStrategy: ProductOptionUpdateVariantStrategy
+        ) {
+          productOptionUpdate(
+            productId: $productId
+            option: $option
+            optionValuesToUpdate: $optionValuesToUpdate
+            variantStrategy: $variantStrategy
+          ) {
+            userErrors { field message code }
+          }
+        }
+        """
+
+        successes: List[int]          = []
+        failures: List[Dict[str, Any]] = []
+
+        for pid in params.product_ids:
+            try:
+                product_gid = f"gid://shopify/Product/{pid}"
+
+                # Fetch product options
+                fetch_result = await _graphql(fetch_query, {"id": product_gid})
+                product = fetch_result.get("product")
+                if not product:
+                    failures.append({"product_id": pid, "error": "product not found"})
+                    continue
+
+                target = next(
+                    (o for o in product.get("options", []) if o["name"].lower() == params.option_name.lower()),
+                    None,
+                )
+                if not target:
+                    failures.append({
+                        "product_id": pid,
+                        "error": f"option '{params.option_name}' not found",
+                    })
+                    continue
+
+                # Map option values to GIDs
+                option_values_to_update = []
+                unmapped = []
+                for ov in target.get("optionValues", []):
+                    expected_handle = _to_handle(ov["name"])
+                    gid = handle_to_gid.get(expected_handle)
+                    if not gid:
+                        unmapped.append(ov["name"])
+                        continue
+                    option_values_to_update.append({
+                        "id": ov["id"],
+                        "linkedMetafieldValue": gid,
+                    })
+
+                if unmapped:
+                    failures.append({
+                        "product_id": pid,
+                        "error": f"unmapped option values: {unmapped}",
+                    })
+                    continue
+
+                variables = {
+                    "productId": product_gid,
+                    "option": {
+                        "id": target["id"],
+                        "linkedMetafield": {
+                            "namespace": params.namespace,
+                            "key":       params.key,
+                        },
+                    },
+                    "optionValuesToUpdate": option_values_to_update,
+                    "variantStrategy": "LEAVE_AS_IS",
+                }
+
+                mut_result  = await _graphql(mutation, variables)
+                user_errors = mut_result.get("productOptionUpdate", {}).get("userErrors", [])
+
+                if user_errors:
+                    failures.append({
+                        "product_id": pid,
+                        "error": "; ".join(
+                            f"{e.get('code')}: {e.get('message')}" for e in user_errors
+                        ),
+                    })
+                else:
+                    successes.append(pid)
+            except Exception as e:
+                failures.append({"product_id": pid, "error": f"{type(e).__name__}: {e}"})
+
+        return _fmt({
+            "total":         len(params.product_ids),
+            "success_count": len(successes),
+            "failure_count": len(failures),
+            "failures":      failures,
+            "metaobject_handles_available": list(handle_to_gid.keys()),
+        })
     except Exception as e:
         return _error(e)
 # ---------------------------------------------------------------------------
