@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-#!/usr/bin/env python3
 """
 Shopify MCP Server — Full Admin API access via FastMCP.
 Provides tools for managing products, orders, customers, collections,
@@ -851,20 +850,48 @@ async def shopify_link_option_to_metaobject(params: LinkOptionToMetaobjectInput)
                 f"Option '{params.option_name}' not found. Available options: {available}"
             ))
 
-        # 2) Build optionValuesToUpdate — each existing option value needs to be
-        # mapped to a metaobject handle. Shopify requires explicit mappings.
-        # We auto-generate the handle by lowercasing and replacing spaces with dashes.
-        # E.g. "Marco blanco" -> "marco-blanco", "Sin marco" -> "sin-marco".
+        # 2) Fetch metaobject entries of the target type to build a handle -> GID map.
+        # Shopify's productOptionUpdate expects the metaobject GID as linkedMetafieldValue,
+        # not the handle string.
+        metaobject_type = f"{params.namespace}--{params.key}"
+        list_query = """
+        query ListMetaobjects($type: String!, $first: Int!) {
+          metaobjects(type: $type, first: $first) {
+            edges {
+              node { id handle }
+            }
+          }
+        }
+        """
+        list_result   = await _graphql(list_query, {"type": metaobject_type, "first": 250})
+        handle_to_gid = {
+            edge["node"]["handle"]: edge["node"]["id"]
+            for edge in list_result.get("metaobjects", {}).get("edges", [])
+        }
+
+        # Auto-generate expected handle from each option value name
+        # ("Marco blanco" -> "marco-blanco", "Sin marco" -> "sin-marco")
         def _to_handle(name: str) -> str:
             return name.strip().lower().replace(" ", "-")
 
-        option_values_to_update = [
-            {
+        option_values_to_update = []
+        unmapped = []
+        for ov in target.get("optionValues", []):
+            expected_handle = _to_handle(ov["name"])
+            gid = handle_to_gid.get(expected_handle)
+            if not gid:
+                unmapped.append({"name": ov["name"], "expected_handle": expected_handle})
+                continue
+            option_values_to_update.append({
                 "id": ov["id"],
-                "linkedMetafieldValue": _to_handle(ov["name"]),
-            }
-            for ov in target.get("optionValues", [])
-        ]
+                "linkedMetafieldValue": gid,
+            })
+
+        if unmapped:
+            return _error(RuntimeError(
+                f"Could not map these option values to metaobject entries: {unmapped}. "
+                f"Available metaobject handles for type '{metaobject_type}': {list(handle_to_gid.keys())}"
+            ))
 
         # 3) Run the productOptionUpdate mutation with linkedMetafield
         mutation = """
